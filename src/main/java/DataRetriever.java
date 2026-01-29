@@ -5,6 +5,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 public class DataRetriever {
@@ -442,6 +443,21 @@ public class DataRetriever {
     }
 
     public Order saveOrder(Order toSave) {
+        if (toSave.getId() != null) {
+            Order existingOrder = findOrderById(toSave.getId());
+
+            if (existingOrder.getPaymentStatus() == PaymentStatusEnum.PAID) {
+                // Vérifier si on tente de modifier la commande
+                if (isOrderModified(existingOrder, toSave)) {
+                    throw new RuntimeException(
+                            "Cannot modify order id=" + toSave.getId() +
+                                    " because it has already been paid (PAID status). " +
+                                    "Paid orders cannot be modified."
+                    );
+                }
+            }
+        }
+
         String upsertOrderSql = """
             INSERT INTO "order" (id, reference, creation_datetime, payment_status, id_sale)
             VALUES (?, ?, ?, ?::payment_status, ?)
@@ -485,7 +501,10 @@ public class DataRetriever {
                 }
             }
 
-            saveDishOrdersForOrder(conn, toSave, orderId);
+            if (toSave.getId() == null ||
+                    (toSave.getId() != null && findOrderById(toSave.getId()).getPaymentStatus() != PaymentStatusEnum.PAID)) {
+                saveDishOrdersForOrder(conn, toSave, orderId);
+            }
 
             conn.commit();
             return findOrderById(orderId);
@@ -494,7 +513,57 @@ public class DataRetriever {
         }
     }
 
+    private boolean isOrderModified(Order existingOrder, Order newOrder) {
+        if (!Objects.equals(existingOrder.getReference(), newOrder.getReference())) {
+            return true;
+        }
+
+        if (!Objects.equals(existingOrder.getCreationDatetime(), newOrder.getCreationDatetime())) {
+            return true;
+        }
+
+        return areDishOrdersModified(existingOrder.getDishOrders(), newOrder.getDishOrders());
+    }
+
+    private boolean areDishOrdersModified(List<DishOrder> existingDishOrders, List<DishOrder> newDishOrders) {
+        if (existingDishOrders == null && newDishOrders == null) {
+            return false;
+        }
+
+        if ((existingDishOrders == null && newDishOrders != null) ||
+                (existingDishOrders != null && newDishOrders == null)) {
+            return true;
+        }
+
+        if (existingDishOrders.size() != newDishOrders.size()) {
+            return true;
+        }
+
+        for (int i = 0; i < existingDishOrders.size(); i++) {
+            DishOrder existing = existingDishOrders.get(i);
+            DishOrder newDishOrder = newDishOrders.get(i);
+
+            if (!Objects.equals(existing.getId(), newDishOrder.getId()) ||
+                    !Objects.equals(existing.getDish().getId(), newDishOrder.getDish().getId()) ||
+                    !Objects.equals(existing.getQuantity(), newDishOrder.getQuantity())) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private void saveDishOrdersForOrder(Connection conn, Order order, Integer orderId) throws SQLException {
+        if (order.getId() != null) {
+            Order existingOrder = findOrderById(order.getId());
+            if (existingOrder.getPaymentStatus() == PaymentStatusEnum.PAID) {
+                throw new RuntimeException(
+                        "Cannot modify dish orders for order id=" + order.getId() +
+                                " because it has already been paid (PAID status)."
+                );
+            }
+        }
+
         try (PreparedStatement ps = conn.prepareStatement("DELETE FROM dish_order WHERE id_order = ?")) {
             ps.setInt(1, orderId);
             ps.executeUpdate();
@@ -558,17 +627,14 @@ public class DataRetriever {
     }
 
     public Sale createSaleFrom(Order order) {
-        // Vérifier que la commande est payée
         if (order.getPaymentStatus() != PaymentStatusEnum.PAID) {
             throw new RuntimeException("Cannot create sale from unpaid order. Order payment status: " + order.getPaymentStatus());
         }
 
-        // Vérifier que la commande existe en base
         if (order.getId() == null) {
             throw new RuntimeException("Order must be saved before creating a sale");
         }
 
-        // Vérifier si une vente existe déjà pour cette commande
         if (order.getSale() != null) {
             throw new RuntimeException("Sale already exists for order id: " + order.getId());
         }
