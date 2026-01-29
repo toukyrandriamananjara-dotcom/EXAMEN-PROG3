@@ -1,6 +1,7 @@
 package main.java;
 
 import java.sql.*;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -8,11 +9,15 @@ import java.util.stream.Collectors;
 
 public class DataRetriever {
 
-    Order findOrderByReference(String reference) {
+    public Order findOrderByReference(String reference) {
         DBConnection dbConnection = new DBConnection();
         try (Connection connection = dbConnection.getConnection()) {
             PreparedStatement preparedStatement = connection.prepareStatement("""
-                    select id, reference, creation_datetime from "order" where reference like ?""");
+                select o.id, o.reference, o.creation_datetime, o.payment_status, o.id_sale,
+                       s.creation_datetime as sale_creation_datetime
+                from "order" o
+                left join sale s on o.id_sale = s.id
+                where o.reference like ?""");
             preparedStatement.setString(1, reference);
             ResultSet resultSet = preparedStatement.executeQuery();
             if (resultSet.next()) {
@@ -21,7 +26,19 @@ public class DataRetriever {
                 order.setId(idOrder);
                 order.setReference(resultSet.getString("reference"));
                 order.setCreationDatetime(resultSet.getTimestamp("creation_datetime").toInstant());
-                order.setDishOrderList(findDishOrderByIdOrder(idOrder));
+                order.setPaymentStatus(PaymentStatusEnum.valueOf(resultSet.getString("payment_status")));
+
+                Integer saleId = resultSet.getObject("id_sale") != null ?
+                        resultSet.getInt("id_sale") : null;
+                if (saleId != null) {
+                    Sale sale = new Sale();
+                    sale.setId(saleId);
+                    sale.setCreationDatetime(resultSet.getTimestamp("sale_creation_datetime").toInstant());
+                    sale.setOrder(order);
+                    order.setSale(sale);
+                }
+
+                order.setDishOrders(findDishOrderByIdOrder(idOrder));
                 return order;
             }
             throw new RuntimeException("Order not found with reference " + reference);
@@ -423,4 +440,193 @@ public class DataRetriever {
             ps.executeQuery();
         }
     }
+
+    public Order saveOrder(Order toSave) {
+        String upsertOrderSql = """
+            INSERT INTO "order" (id, reference, creation_datetime, payment_status, id_sale)
+            VALUES (?, ?, ?, ?::payment_status, ?)
+            ON CONFLICT (id) DO UPDATE
+            SET reference = EXCLUDED.reference,
+                creation_datetime = EXCLUDED.creation_datetime,
+                payment_status = EXCLUDED.payment_status,
+                id_sale = EXCLUDED.id_sale
+            RETURNING id
+            """;
+
+        try (Connection conn = new DBConnection().getConnection()) {
+            conn.setAutoCommit(false);
+            Integer orderId;
+
+            try (PreparedStatement ps = conn.prepareStatement(upsertOrderSql)) {
+                if (toSave.getId() != null) {
+                    ps.setInt(1, toSave.getId());
+                } else {
+                    ps.setInt(1, getNextSerialValue(conn, "order", "id"));
+                }
+                ps.setString(2, toSave.getReference());
+
+                if (toSave.getCreationDatetime() != null) {
+                    ps.setTimestamp(3, Timestamp.from(toSave.getCreationDatetime()));
+                } else {
+                    ps.setTimestamp(3, Timestamp.from(Instant.now()));
+                }
+
+                ps.setString(4, toSave.getPaymentStatus().name());
+
+                if (toSave.getSale() != null && toSave.getSale().getId() != null) {
+                    ps.setInt(5, toSave.getSale().getId());
+                } else {
+                    ps.setNull(5, Types.INTEGER);
+                }
+
+                try (ResultSet rs = ps.executeQuery()) {
+                    rs.next();
+                    orderId = rs.getInt(1);
+                }
+            }
+
+            saveDishOrdersForOrder(conn, toSave, orderId);
+
+            conn.commit();
+            return findOrderById(orderId);
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private void saveDishOrdersForOrder(Connection conn, Order order, Integer orderId) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement("DELETE FROM dish_order WHERE id_order = ?")) {
+            ps.setInt(1, orderId);
+            ps.executeUpdate();
+        }
+
+        if (order.getDishOrders() != null && !order.getDishOrders().isEmpty()) {
+            String insertDishOrderSql = """
+                INSERT INTO dish_order (id, id_order, id_dish, quantity)
+                VALUES (?, ?, ?, ?)
+                """;
+
+            try (PreparedStatement ps = conn.prepareStatement(insertDishOrderSql)) {
+                for (DishOrder dishOrder : order.getDishOrders()) {
+                    ps.setInt(1, getNextSerialValue(conn, "dish_order", "id"));
+                    ps.setInt(2, orderId);
+                    ps.setInt(3, dishOrder.getDish().getId());
+                    ps.setInt(4, dishOrder.getQuantity());
+                    ps.addBatch();
+                }
+                ps.executeBatch();
+            }
+        }
+    }
+
+    private Order findOrderById(Integer id) {
+        DBConnection dbConnection = new DBConnection();
+        try (Connection connection = dbConnection.getConnection()) {
+            PreparedStatement preparedStatement = connection.prepareStatement("""
+                select o.id, o.reference, o.creation_datetime, o.payment_status, o.id_sale,
+                       s.creation_datetime as sale_creation_datetime
+                from "order" o
+                left join sale s on o.id_sale = s.id
+                where o.id = ?""");
+            preparedStatement.setInt(1, id);
+            ResultSet resultSet = preparedStatement.executeQuery();
+            if (resultSet.next()) {
+                Order order = new Order();
+                Integer idOrder = resultSet.getInt("id");
+                order.setId(idOrder);
+                order.setReference(resultSet.getString("reference"));
+                order.setCreationDatetime(resultSet.getTimestamp("creation_datetime").toInstant());
+                order.setPaymentStatus(PaymentStatusEnum.valueOf(resultSet.getString("payment_status")));
+
+                Integer saleId = resultSet.getObject("id_sale") != null ?
+                        resultSet.getInt("id_sale") : null;
+                if (saleId != null) {
+                    Sale sale = new Sale();
+                    sale.setId(saleId);
+                    sale.setCreationDatetime(resultSet.getTimestamp("sale_creation_datetime").toInstant());
+                    sale.setOrder(order);
+                    order.setSale(sale);
+                }
+
+                order.setDishOrders(findDishOrderByIdOrder(idOrder));
+                return order;
+            }
+            throw new RuntimeException("Order not found with id " + id);
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public Sale createSaleFrom(Order order) {
+        // Vérifier que la commande est payée
+        if (order.getPaymentStatus() != PaymentStatusEnum.PAID) {
+            throw new RuntimeException("Cannot create sale from unpaid order. Order payment status: " + order.getPaymentStatus());
+        }
+
+        // Vérifier que la commande existe en base
+        if (order.getId() == null) {
+            throw new RuntimeException("Order must be saved before creating a sale");
+        }
+
+        // Vérifier si une vente existe déjà pour cette commande
+        if (order.getSale() != null) {
+            throw new RuntimeException("Sale already exists for order id: " + order.getId());
+        }
+
+        String insertSaleSql = """
+            INSERT INTO sale (id, creation_datetime)
+            VALUES (?, ?)
+            ON CONFLICT (id) DO NOTHING
+            RETURNING id
+            """;
+
+        try (Connection conn = new DBConnection().getConnection()) {
+            conn.setAutoCommit(false);
+            Integer saleId;
+
+            try (PreparedStatement ps = conn.prepareStatement(insertSaleSql)) {
+                int nextSaleId = getNextSerialValue(conn, "sale", "id");
+                ps.setInt(1, nextSaleId);
+                ps.setTimestamp(2, Timestamp.from(Instant.now()));
+
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        saleId = rs.getInt(1);
+                    } else {
+                        conn.rollback();
+                        return null;
+                    }
+                }
+            }
+
+            String updateOrderSql = """
+                UPDATE "order" 
+                SET id_sale = ? 
+                WHERE id = ? AND id_sale IS NULL
+                """;
+
+            try (PreparedStatement ps = conn.prepareStatement(updateOrderSql)) {
+                ps.setInt(1, saleId);
+                ps.setInt(2, order.getId());
+                int rowsUpdated = ps.executeUpdate();
+
+                if (rowsUpdated == 0) {
+                    conn.rollback();
+                    throw new RuntimeException("Order already has a sale or order not found");
+                }
+            }
+
+            conn.commit();
+
+            Sale sale = new Sale();
+            sale.setId(saleId);
+            sale.setCreationDatetime(Instant.now());
+            sale.setOrder(order);
+
+            return sale;
+        } catch (SQLException e) {
+            throw new RuntimeException("Error creating sale: " + e.getMessage(), e);
+        }
+    }
 }
+
